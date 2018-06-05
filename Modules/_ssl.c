@@ -57,14 +57,6 @@
 #include <arpa/inet.h>
 #endif
 
-/* Don't warn about deprecated functions */
-#ifdef __GNUC__
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-#endif
-#ifdef __clang__
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-#endif
-
 /* Include OpenSSL header files */
 #include "openssl/rsa.h"
 #include "openssl/crypto.h"
@@ -167,7 +159,17 @@ struct py_ssl_library_code {
 #ifndef PY_OPENSSL_1_1_API
 /* OpenSSL 1.1 API shims for OpenSSL < 1.1.0 and LibreSSL < 2.7.0 */
 
+#ifndef OPENSSL_VERSION_1_1
+#define ASN1_STRING_get0_data ASN1_STRING_data
 #define TLS_method SSLv23_method
+#define TLS_client_method SSLv23_client_method
+#define TLS_server_method SSLv23_server_method
+#define X509_get0_notBefore X509_get_notBefore
+#define X509_get0_notAfter X509_get_notAfter
+#define OpenSSL_version_num SSLeay
+#define OpenSSL_version SSLeay_version
+#define OPENSSL_VERSION SSLEAY_VERSION
+#endif
 
 static int X509_NAME_ENTRY_set(const X509_NAME_ENTRY *ne)
 {
@@ -1027,8 +1029,9 @@ _get_peer_alt_names (X509 *certificate) {
                     goto fail;
                 }
                 PyTuple_SET_ITEM(t, 0, v);
-                v = PyString_FromStringAndSize((char *)ASN1_STRING_data(as),
-                                               ASN1_STRING_length(as));
+                v = PyString_FromStringAndSize(
+                    (char *)ASN1_STRING_get0_data(as),
+                    ASN1_STRING_length(as));
                 if (v == NULL) {
                     Py_DECREF(t);
                     goto fail;
@@ -1328,7 +1331,7 @@ _decode_certificate(X509 *certificate) {
     Py_DECREF(sn_obj);
 
     (void) BIO_reset(biobuf);
-    notBefore = X509_get_notBefore(certificate);
+    notBefore = X509_get0_notBefore(certificate);
     ASN1_TIME_print(biobuf, notBefore);
     len = BIO_gets(biobuf, buf, sizeof(buf)-1);
     if (len < 0) {
@@ -1345,7 +1348,7 @@ _decode_certificate(X509 *certificate) {
     Py_DECREF(pnotBefore);
 
     (void) BIO_reset(biobuf);
-    notAfter = X509_get_notAfter(certificate);
+    notAfter = X509_get0_notAfter(certificate);
     ASN1_TIME_print(biobuf, notAfter);
     len = BIO_gets(biobuf, buf, sizeof(buf)-1);
     if (len < 0) {
@@ -2176,6 +2179,7 @@ context_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     int proto_version = PY_SSL_VERSION_TLS;
     long options;
     SSL_CTX *ctx = NULL;
+    int result = 0;
 
     if (!PyArg_ParseTupleAndKeywords(
         args, kwds, "i:_SSLContext", kwlist,
@@ -2183,34 +2187,107 @@ context_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         return NULL;
 
     PySSL_BEGIN_ALLOW_THREADS
-    if (proto_version == PY_SSL_VERSION_TLS1)
-        ctx = SSL_CTX_new(TLSv1_method());
-#if HAVE_TLSv1_2
-    else if (proto_version == PY_SSL_VERSION_TLS1_1)
-        ctx = SSL_CTX_new(TLSv1_1_method());
-    else if (proto_version == PY_SSL_VERSION_TLS1_2)
-        ctx = SSL_CTX_new(TLSv1_2_method());
-#endif
-#ifndef OPENSSL_NO_SSL3
-    else if (proto_version == PY_SSL_VERSION_SSL3)
-        ctx = SSL_CTX_new(SSLv3_method());
-#endif
-#ifndef OPENSSL_NO_SSL2
-    else if (proto_version == PY_SSL_VERSION_SSL2)
+    switch (proto_version) {
+#if OPENSSL_VERSION_NUMBER <= 0x10100000L
+    /* OpenSSL < 1.1.0 or not LibreSSL
+     * Use old-style methods for OpenSSL 1.0.2
+     */
+#if defined(SSL2_VERSION) && !defined(OPENSSL_NO_SSL2)
+    case PY_SSL_VERSION_SSL2:
         ctx = SSL_CTX_new(SSLv2_method());
+        break;
 #endif
-    else if (proto_version == PY_SSL_VERSION_TLS)
+#if defined(SSL3_VERSION) && !defined(OPENSSL_NO_SSL3)
+    case PY_SSL_VERSION_SSL3:
+        ctx = SSL_CTX_new(SSLv3_method());
+        break;
+#endif
+#if defined(TLS1_VERSION) && !defined(OPENSSL_NO_TLS1)
+    case PY_SSL_VERSION_TLS1:
+        ctx = SSL_CTX_new(TLSv1_method());
+        break;
+#endif
+#if defined(TLS1_1_VERSION) && !defined(OPENSSL_NO_TLS1_1)
+    case PY_SSL_VERSION_TLS1_1:
+        ctx = SSL_CTX_new(TLSv1_1_method());
+        break;
+#endif
+#if defined(TLS1_2_VERSION) && !defined(OPENSSL_NO_TLS1_2)
+    case PY_SSL_VERSION_TLS1_2:
+        ctx = SSL_CTX_new(TLSv1_2_method());
+        break;
+#endif
+#else
+    /* OpenSSL >= 1.1 or LibreSSL
+     * create context with TLS_method for all protocols
+     * no SSLv2_method in OpenSSL 1.1.
+     */
+#if defined(SSL3_VERSION) && !defined(OPENSSL_NO_SSL3)
+    case PY_SSL_VERSION_SSL3:
         ctx = SSL_CTX_new(TLS_method());
-    else
-        proto_version = -1;
+        if (ctx != NULL) {
+            if (!SSL_CTX_set_min_proto_version(ctx, SSL3_VERSION))
+                result = -2;
+            if (!SSL_CTX_set_max_proto_version(ctx, SSL3_VERSION))
+                result = -2;
+        }
+        break;
+#endif
+#if defined(TLS1_VERSION) && !defined(OPENSSL_NO_TLS1)
+    case PY_SSL_VERSION_TLS1:
+        ctx = SSL_CTX_new(TLS_method());
+        if (ctx != NULL) {
+            if (!SSL_CTX_set_min_proto_version(ctx, TLS1_VERSION))
+                result = -2;
+            if (!SSL_CTX_set_max_proto_version(ctx, TLS1_VERSION))
+                result = -2;
+        }
+        break;
+#endif
+#if defined(TLS1_1_VERSION) && !defined(OPENSSL_NO_TLS1_1)
+    case PY_SSL_VERSION_TLS1_1:
+        ctx = SSL_CTX_new(TLS_method());
+        if (ctx != NULL) {
+            if (!SSL_CTX_set_min_proto_version(ctx, TLS1_1_VERSION))
+                result = -2;
+            if (!SSL_CTX_set_max_proto_version(ctx, TLS1_1_VERSION))
+                result = -2;
+        }
+        break;
+#endif
+#if defined(TLS1_2_VERSION) && !defined(OPENSSL_NO_TLS1_2)
+    case PY_SSL_VERSION_TLS1_2:
+        ctx = SSL_CTX_new(TLS_method());
+        if (ctx != NULL) {
+            if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION))
+                result = -2;
+            if (!SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION))
+                result = -2;
+        }
+        break;
+#endif
+#endif /* OpenSSL >= 1.1 */
+    case PY_SSL_VERSION_TLS:
+        /* SSLv23 */
+        ctx = SSL_CTX_new(TLS_method());
+        break;
+    default:
+        result = -1;
+        break;
+    }
     PySSL_END_ALLOW_THREADS
 
-    if (proto_version == -1) {
+    if (result == -1) {
         PyErr_SetString(PyExc_ValueError,
                         "invalid protocol version");
         return NULL;
     }
-    if (ctx == NULL) {
+    else if (result == -2) {
+        PyErr_SetString(PyExc_ValueError,
+                        "protocol configuration error");
+        return NULL;
+    }
+    else if (ctx == NULL) {
         _setSSLError(NULL, 0, __FILE__, __LINE__);
         return NULL;
     }
@@ -4469,10 +4546,10 @@ init_ssl(void)
         return;
 
     /* OpenSSL version */
-    /* SSLeay() gives us the version of the library linked against,
+    /* OPENSSL_version_num() gives us the version of the library linked against,
        which could be different from the headers version.
     */
-    libver = SSLeay();
+    libver = OpenSSL_version_num();
     r = PyLong_FromUnsignedLong(libver);
     if (r == NULL)
         return;
@@ -4482,7 +4559,7 @@ init_ssl(void)
     r = Py_BuildValue("IIIII", major, minor, fix, patch, status);
     if (r == NULL || PyModule_AddObject(m, "OPENSSL_VERSION_INFO", r))
         return;
-    r = PyString_FromString(SSLeay_version(SSLEAY_VERSION));
+    r = PyString_FromString(OpenSSL_version(OPENSSL_VERSION));
     if (r == NULL || PyModule_AddObject(m, "OPENSSL_VERSION", r))
         return;
 
